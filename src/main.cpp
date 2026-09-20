@@ -20,6 +20,8 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #include <M5Cardputer.h>
 #include <SPI.h>
 #include <SD.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -36,6 +38,914 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #define SD_SPI_CS_PIN    12
 
 const uint32_t SD_SPI_FREQUENCY_HZ = 10000000;
+
+// FLORA1-DUAL-DISPLAY-MIRROR rev4
+// External ILI9341 shares the SD SPI bus but has its own chip-select.
+#define EXT_TFT_RST_PIN   3
+#define EXT_TFT_CS_PIN    5
+#define EXT_TFT_DC_PIN    6
+
+constexpr uint32_t EXT_TFT_SPI_FREQUENCY_HZ = 10000000;
+constexpr int EXT_TFT_WIDTH = 320;
+constexpr int EXT_TFT_HEIGHT = 240;
+constexpr int BUILTIN_MIRROR_WIDTH = 240;
+constexpr int BUILTIN_MIRROR_HEIGHT = 135;
+constexpr int EXT_TFT_MIRROR_X =
+    (EXT_TFT_WIDTH - BUILTIN_MIRROR_WIDTH) / 2;
+constexpr int EXT_TFT_MIRROR_Y =
+    (EXT_TFT_HEIGHT - BUILTIN_MIRROR_HEIGHT) / 2;
+
+Adafruit_ILI9341 externalTft(
+    &SPI,
+    EXT_TFT_DC_PIN,
+    EXT_TFT_CS_PIN,
+    EXT_TFT_RST_PIN
+);
+
+class FloraMirroredDisplay
+{
+public:
+    // Keep history bounded in RAM. The visible viewport is identical on both
+    // displays; the external panel simply centers the same 240x135 surface.
+    static constexpr size_t CHAT_HISTORY_LINES = 64;
+    static constexpr size_t CHAT_VISIBLE_LINES = 14;
+    static constexpr size_t CHAT_COLUMNS = 38;
+
+    enum class ChatTone : uint8_t
+    {
+        User,
+        Flora,
+        Text,
+        Secondary,
+        Error
+    };
+
+    struct ChatLine
+    {
+        String text;
+        ChatTone tone = ChatTone::Text;
+    };
+
+    void enableExternal()
+    {
+        externalReady_ = true;
+    }
+
+    void showReady()
+    {
+        clearChat();
+
+        pushWrappedLine(
+            "F L O R A",
+            ChatTone::Flora
+        );
+        pushWrappedLine(
+            "Poppy's pocket sister",
+            ChatTone::Flora
+        );
+        pushWrappedLine(
+            "--------------------",
+            ChatTone::Secondary
+        );
+        pushWrappedLine(
+            "Hi! I'm Flora.",
+            ChatTone::Text
+        );
+        pushWrappedLine(
+            "Ask me about your collection.",
+            ChatTone::Text
+        );
+
+        renderChat("");
+    }
+
+    void showInput(
+        const String &input)
+    {
+        if (idleMode_)
+        {
+            return;
+        }
+
+        scrollOffsetFromBottom_ = 0;
+        renderChat(input);
+    }
+
+    void scrollUp(
+        const String &input)
+    {
+        if (idleMode_)
+        {
+            return;
+        }
+
+        const size_t maxOffset =
+            chatCount_ > CHAT_VISIBLE_LINES
+                ? chatCount_ - CHAT_VISIBLE_LINES
+                : 0;
+
+        if (scrollOffsetFromBottom_ < maxOffset)
+        {
+            ++scrollOffsetFromBottom_;
+            renderChat(input);
+        }
+    }
+
+    void scrollDown(
+        const String &input)
+    {
+        if (idleMode_)
+        {
+            return;
+        }
+
+        if (scrollOffsetFromBottom_ > 0)
+        {
+            --scrollOffsetFromBottom_;
+            renderChat(input);
+        }
+    }
+
+    void beginChatTurn(
+        const String &userText)
+    {
+        idleMode_ = false;
+        scrollOffsetFromBottom_ = 0;
+        capturing_ = true;
+        captureLine_ = "";
+        captureTone_ = ChatTone::Text;
+
+        if (chatCount_ > 0)
+        {
+            pushLine(
+                "",
+                ChatTone::Text
+            );
+        }
+
+        pushWrappedLine(
+            String("You: ") + userText,
+            ChatTone::User
+        );
+
+        pushLine(
+            "Flora:",
+            ChatTone::Flora
+        );
+
+        renderChat("");
+    }
+
+    void finishChatTurn()
+    {
+        if (!capturing_)
+        {
+            return;
+        }
+
+        flushCaptureLine();
+
+        capturing_ = false;
+        captureLine_ = "";
+
+        renderChat("");
+    }
+
+    void showIdle(
+        const uint16_t *frame)
+    {
+        idleMode_ = true;
+
+        clearMirrorSurface();
+
+        // Native 64x64 RGB565 avatar on the same 240x135 coordinates
+        // on both displays.
+        constexpr int avatarX = 88;
+        constexpr int avatarY = 20;
+
+        for (int row = 0;
+             row < FLORA_AVATAR_64_HEIGHT;
+             ++row)
+        {
+            for (int column = 0;
+                 column < FLORA_AVATAR_64_WIDTH;
+                 ++column)
+            {
+                const size_t index =
+                    static_cast<size_t>(row) *
+                        FLORA_AVATAR_64_WIDTH +
+                    column;
+
+                const uint16_t color =
+                    pgm_read_word(
+                        &frame[index]
+                    );
+
+                M5Cardputer.Display.drawPixel(
+                    avatarX + column,
+                    avatarY + row,
+                    color
+                );
+            }
+        }
+
+        if (externalReady_)
+        {
+            externalTft.drawRGBBitmap(
+                EXT_TFT_MIRROR_X + avatarX,
+                EXT_TFT_MIRROR_Y + avatarY,
+                frame,
+                FLORA_AVATAR_64_WIDTH,
+                FLORA_AVATAR_64_HEIGHT
+            );
+        }
+
+        drawMirroredText(
+            57,
+            116,
+            "Flora | offline & ready",
+            ChatTone::Text
+        );
+    }
+
+    void leaveIdleAndRestore(
+        const String &input)
+    {
+        idleMode_ = false;
+        scrollOffsetFromBottom_ = 0;
+        renderChat(input);
+    }
+
+    // Compatibility surface for the existing UI functions. During command
+    // execution, those functions are used only as a text source for the
+    // rolling chat. Their frame-clearing/cursor operations must not mutate
+    // either physical display.
+    void setRotation(
+        uint8_t rotation)
+    {
+        M5Cardputer.Display.setRotation(
+            rotation
+        );
+    }
+
+    void fillScreen(
+        uint32_t)
+    {
+        // Intentionally ignored. renderChat()/showIdle() own full redraws.
+    }
+
+    void setCursor(
+        int32_t,
+        int32_t)
+    {
+        // Intentionally ignored by the rolling chat renderer.
+    }
+
+    void setTextColor(
+        uint32_t foreground,
+        uint32_t)
+    {
+        // Preserve logical intent without passing display-library color
+        // encodings between LovyanGFX and Adafruit_GFX.
+        if (foreground == GREEN)
+        {
+            captureTone_ =
+                ChatTone::Flora;
+        }
+        else if (foreground == YELLOW)
+        {
+            captureTone_ =
+                ChatTone::User;
+        }
+        else
+        {
+            captureTone_ =
+                ChatTone::Text;
+        }
+    }
+
+    void setTextColor(
+        uint32_t foreground)
+    {
+        setTextColor(
+            foreground,
+            BLACK
+        );
+    }
+
+    void setTextSize(
+        uint8_t)
+    {
+        // Mirrored chat always uses size 1 so both displays have identical
+        // line geometry.
+    }
+
+    void setTextWrap(
+        bool)
+    {
+        // Wrapping is handled explicitly by pushWrappedLine().
+    }
+
+    void drawPixel(
+        int32_t,
+        int32_t,
+        uint16_t)
+    {
+        // Avatar drawing is handled atomically by showIdle().
+    }
+
+    void mirrorRgb565Bitmap(
+        int32_t,
+        int32_t,
+        const uint16_t *,
+        int16_t,
+        int16_t)
+    {
+        // Compatibility no-op. showIdle() owns mirrored avatar drawing.
+    }
+
+    template <typename T>
+    size_t print(
+        const T &value)
+    {
+        const String textValue(value);
+
+        if (capturing_)
+        {
+            appendCaptureText(
+                textValue
+            );
+        }
+
+        return textValue.length();
+    }
+
+    size_t print(
+        const String &value)
+    {
+        if (capturing_)
+        {
+            appendCaptureText(
+                value
+            );
+        }
+
+        return value.length();
+    }
+
+    size_t print(
+        const char *value)
+    {
+        if (value == nullptr)
+        {
+            return 0;
+        }
+
+        const String textValue(value);
+
+        if (capturing_)
+        {
+            appendCaptureText(
+                textValue
+            );
+        }
+
+        return textValue.length();
+    }
+
+    size_t print(
+        double value,
+        int digits)
+    {
+        const String textValue(
+            value,
+            digits
+        );
+
+        if (capturing_)
+        {
+            appendCaptureText(
+                textValue
+            );
+        }
+
+        return textValue.length();
+    }
+
+    size_t print(
+        float value,
+        int digits)
+    {
+        return print(
+            static_cast<double>(value),
+            digits
+        );
+    }
+
+    size_t println()
+    {
+        if (capturing_)
+        {
+            flushCaptureLine();
+            renderChat("");
+        }
+
+        return 1;
+    }
+
+    template <typename T>
+    size_t println(
+        const T &value)
+    {
+        const String textValue(value);
+
+        if (capturing_)
+        {
+            appendCaptureText(
+                textValue
+            );
+            flushCaptureLine();
+            renderChat("");
+        }
+
+        return textValue.length() + 1;
+    }
+
+    size_t println(
+        const String &value)
+    {
+        if (capturing_)
+        {
+            appendCaptureText(
+                value
+            );
+            flushCaptureLine();
+            renderChat("");
+        }
+
+        return value.length() + 1;
+    }
+
+    size_t println(
+        const char *value)
+    {
+        if (value == nullptr)
+        {
+            return println();
+        }
+
+        const String textValue(value);
+
+        if (capturing_)
+        {
+            appendCaptureText(
+                textValue
+            );
+            flushCaptureLine();
+            renderChat("");
+        }
+
+        return textValue.length() + 1;
+    }
+
+    size_t println(
+        double value,
+        int digits)
+    {
+        const String textValue(
+            value,
+            digits
+        );
+
+        if (capturing_)
+        {
+            appendCaptureText(
+                textValue
+            );
+            flushCaptureLine();
+            renderChat("");
+        }
+
+        return textValue.length() + 1;
+    }
+
+    size_t println(
+        float value,
+        int digits)
+    {
+        return println(
+            static_cast<double>(value),
+            digits
+        );
+    }
+
+private:
+    ChatLine chat_[CHAT_HISTORY_LINES];
+    size_t chatStart_ = 0;
+    size_t chatCount_ = 0;
+
+    String captureLine_;
+    ChatTone captureTone_ = ChatTone::Text;
+
+    bool capturing_ = false;
+    bool idleMode_ = false;
+    bool externalReady_ = false;
+    size_t scrollOffsetFromBottom_ = 0;
+
+    void clearChat()
+    {
+        chatStart_ = 0;
+        chatCount_ = 0;
+        captureLine_ = "";
+    }
+
+    static uint32_t builtinColor(
+        ChatTone tone)
+    {
+        // LovyanGFX expects RGB888-style values here. Do not reuse
+        // Adafruit/RGB565 constants on the built-in display.
+        switch (tone)
+        {
+            case ChatTone::User:
+                return 0xFFFF00; // yellow
+
+            case ChatTone::Flora:
+                return 0x00FF00; // green
+
+            case ChatTone::Secondary:
+                return 0xC0C0C0; // light gray
+
+            case ChatTone::Error:
+                return 0xFFA500; // amber
+
+            case ChatTone::Text:
+            default:
+                return 0xFFFFFF; // white
+        }
+    }
+
+    static uint16_t externalColor(
+        ChatTone tone)
+    {
+        switch (tone)
+        {
+            case ChatTone::User:
+                return ILI9341_YELLOW;
+
+            case ChatTone::Flora:
+                return ILI9341_GREEN;
+
+            case ChatTone::Secondary:
+                return 0xC618;
+
+            case ChatTone::Error:
+                return 0xFD20;
+
+            case ChatTone::Text:
+            default:
+                return ILI9341_WHITE;
+        }
+    }
+
+    void clearMirrorSurface()
+    {
+        M5Cardputer.Display.fillScreen(
+            BLACK
+        );
+
+        if (externalReady_)
+        {
+            // Clear the complete external panel so no stale pixels survive
+            // outside the centered 240x135 mirrored viewport.
+            externalTft.fillScreen(
+                ILI9341_BLACK
+            );
+        }
+    }
+
+    void drawMirroredText(
+        int16_t x,
+        int16_t y,
+        const String &value,
+        ChatTone tone)
+    {
+        M5Cardputer.Display.setTextSize(1);
+        M5Cardputer.Display.setTextWrap(false);
+        M5Cardputer.Display.setCursor(
+            x,
+            y
+        );
+        M5Cardputer.Display.setTextColor(
+            builtinColor(tone),
+            0x000000
+        );
+        M5Cardputer.Display.print(
+            value
+        );
+
+        if (externalReady_)
+        {
+            externalTft.setTextSize(1);
+            externalTft.setTextWrap(false);
+            externalTft.setCursor(
+                EXT_TFT_MIRROR_X + x,
+                EXT_TFT_MIRROR_Y + y
+            );
+            externalTft.setTextColor(
+                externalColor(tone),
+                ILI9341_BLACK
+            );
+            externalTft.print(
+                value
+            );
+        }
+    }
+
+    bool shouldSuppressCapturedLine(
+        const String &line) const
+    {
+        String normalized =
+            line;
+
+        normalized.trim();
+
+        return
+            normalized == "F L O R A" ||
+            normalized ==
+                "--------------------" ||
+            normalized ==
+                "Poppy's pocket sister" ||
+            normalized ==
+                "Hi! I'm Flora." ||
+            normalized ==
+                "Ask me about your collection." ||
+            normalized ==
+                "[ENTER] Ask me something else" ||
+            normalized ==
+                "[ENTER] New command";
+    }
+
+    void appendCaptureText(
+        const String &value)
+    {
+        captureLine_ +=
+            value;
+    }
+
+    void flushCaptureLine()
+    {
+        if (!capturing_)
+        {
+            captureLine_ = "";
+            return;
+        }
+
+        if (!shouldSuppressCapturedLine(
+                captureLine_))
+        {
+            pushWrappedLine(
+                captureLine_,
+                captureTone_
+            );
+        }
+
+        captureLine_ = "";
+    }
+
+    void pushWrappedLine(
+        const String &value,
+        ChatTone tone)
+    {
+        String remaining =
+            value;
+
+        if (remaining.length() == 0)
+        {
+            pushLine(
+                "",
+                tone
+            );
+            return;
+        }
+
+        while (remaining.length() >
+               CHAT_COLUMNS)
+        {
+            size_t split =
+                CHAT_COLUMNS;
+
+            for (size_t i =
+                     CHAT_COLUMNS;
+                 i > 0;
+                 --i)
+            {
+                if (remaining[i] ==
+                    ' ')
+                {
+                    split = i;
+                    break;
+                }
+            }
+
+            String line =
+                remaining.substring(
+                    0,
+                    split
+                );
+
+            line.trim();
+
+            pushLine(
+                line,
+                tone
+            );
+
+            remaining =
+                remaining.substring(
+                    split
+                );
+
+            remaining.trim();
+        }
+
+        pushLine(
+            remaining,
+            tone
+        );
+    }
+
+    void pushLine(
+        const String &value,
+        ChatTone tone)
+    {
+        size_t target = 0;
+
+        if (chatCount_ <
+            CHAT_HISTORY_LINES)
+        {
+            target =
+                (chatStart_ +
+                 chatCount_) %
+                CHAT_HISTORY_LINES;
+
+            ++chatCount_;
+        }
+        else
+        {
+            target =
+                chatStart_;
+
+            chatStart_ =
+                (chatStart_ + 1) %
+                CHAT_HISTORY_LINES;
+        }
+
+        chat_[target].text =
+            value;
+
+        chat_[target].tone =
+            tone;
+    }
+
+    void renderChat(
+        const String &input)
+    {
+        if (idleMode_)
+        {
+            return;
+        }
+
+        clearMirrorSurface();
+
+        const size_t visible =
+            min(
+                chatCount_,
+                CHAT_VISIBLE_LINES
+            );
+
+        const size_t maxOffset =
+            chatCount_ > visible
+                ? chatCount_ - visible
+                : 0;
+
+        if (scrollOffsetFromBottom_ > maxOffset)
+        {
+            scrollOffsetFromBottom_ = maxOffset;
+        }
+
+        const size_t first =
+            chatCount_ > visible
+                ? chatCount_ - visible - scrollOffsetFromBottom_
+                : 0;
+
+        const size_t lastExclusive =
+            min(
+                chatCount_,
+                first + visible
+            );
+
+        int16_t y = 4;
+
+        for (size_t i = first;
+             i < lastExclusive;
+             ++i)
+        {
+            const size_t index =
+                (chatStart_ + i) %
+                CHAT_HISTORY_LINES;
+
+            drawMirroredText(
+                4,
+                y,
+                chat_[index].text,
+                chat_[index].tone
+            );
+
+            y += 8;
+        }
+
+        if (scrollOffsetFromBottom_ > 0)
+        {
+            String scrollLabel =
+                "^ history +" +
+                String(scrollOffsetFromBottom_);
+
+            drawMirroredText(
+                146,
+                124,
+                scrollLabel,
+                ChatTone::Secondary
+            );
+        }
+
+        // Live input always occupies the bottom line on both screens.
+        String prompt =
+            "> " + input;
+
+        if (prompt.length() >
+            CHAT_COLUMNS)
+        {
+            prompt =
+                prompt.substring(
+                    prompt.length() -
+                    CHAT_COLUMNS
+                );
+        }
+
+        if (scrollOffsetFromBottom_ == 0)
+        {
+            drawMirroredText(
+                4,
+                124,
+                prompt,
+                ChatTone::User
+            );
+        }
+    }
+};
+
+FloraMirroredDisplay floraDisplay;
+
+void initializeExternalMirror()
+{
+    pinMode(
+        SD_SPI_CS_PIN,
+        OUTPUT
+    );
+    digitalWrite(
+        SD_SPI_CS_PIN,
+        HIGH
+    );
+
+    pinMode(
+        EXT_TFT_CS_PIN,
+        OUTPUT
+    );
+    digitalWrite(
+        EXT_TFT_CS_PIN,
+        HIGH
+    );
+
+    externalTft.begin(
+        EXT_TFT_SPI_FREQUENCY_HZ
+    );
+
+    externalTft.setRotation(3);
+    externalTft.fillScreen(
+        ILI9341_BLACK
+    );
+    externalTft.setTextWrap(false);
+
+    floraDisplay.enableExternal();
+    floraDisplay.showReady();
+
+    Serial.println(
+        "External ILI9341 mirrored chat initialized."
+    );
+    Serial.println(
+        "Both displays: identical 240x135 rolling chat / idle surface."
+    );
+}
 
 static const char RHEA_TRUSTED_ROOTS[] PROGMEM = R"PEM(
 -----BEGIN CERTIFICATE-----
@@ -113,7 +1023,7 @@ const char *RHEA_SNAPSHOT_ACTIVE_PATH =
     "/RHEA/rhea_snapshot.json";
 
 constexpr size_t MAX_QUERY_LENGTH = 80;
-constexpr size_t VALUE_ITEMIZE_PAGE_SIZE = 4;
+constexpr size_t VALUE_ITEMIZE_PAGE_SIZE = 10;
 
 enum class ValueGroupDomain
 {
@@ -189,15 +1099,22 @@ bool commandExecutionActive = false;
 class CommandActivityScope
 {
 public:
-    CommandActivityScope()
+    explicit CommandActivityScope(
+        const String &userText)
     {
         commandExecutionActive = true;
         idleFaceActive = false;
         idleBlinkFrame = false;
+
+        floraDisplay.beginChatTurn(
+            userText
+        );
     }
 
     ~CommandActivityScope()
     {
+        floraDisplay.finishChatTurn();
+
         commandExecutionActive = false;
         lastUserActivityMillis = millis();
     }
@@ -259,7 +1176,7 @@ struct RfidInfo
 
 void printBoth(const String &text)
 {
-    M5Cardputer.Display.println(text);
+    floraDisplay.println(text);
     Serial.println(text);
 }
 
@@ -376,7 +1293,7 @@ bool recallPreviousCommand(
 void showCommandHistory()
 {
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -435,57 +1352,14 @@ void drawPrompt();
 void drawRheaIdleFace(
     bool blink)
 {
-    auto &display =
-        M5Cardputer.Display;
-
-    display.fillScreen(BLACK);
-    display.setTextSize(1);
-    display.setTextWrap(false);
-
-    // FLORA1-AVATAR64: native 64x64 RGB565 avatar.
-    // Draw at native resolution to avoid runtime scaling/decoder overhead.
-    const int avatarX = 88;
-    const int avatarY = 20;
-
     const uint16_t *frame =
         blink
             ? FLORA_AVATAR_64_BLINK
             : FLORA_AVATAR_64_NORMAL;
 
-    for (int row = 0;
-         row < FLORA_AVATAR_64_HEIGHT;
-         ++row)
-    {
-        for (int column = 0;
-             column < FLORA_AVATAR_64_WIDTH;
-             ++column)
-        {
-            const size_t index =
-                static_cast<size_t>(row) *
-                    FLORA_AVATAR_64_WIDTH +
-                column;
-
-            const uint16_t color =
-                pgm_read_word(
-                    &frame[index]
-                );
-
-            display.drawPixel(
-                avatarX + column,
-                avatarY + row,
-                color
-            );
-        }
-    }
-
-    // Preserve the accepted idle status line.
-    display.setTextWrap(true);
-    display.setTextColor(
-        WHITE,
-        BLACK
+    floraDisplay.showIdle(
+        frame
     );
-    display.setCursor(57, 116);
-    display.println("Flora | offline & ready");
 }
 
 void activateIdleFace()
@@ -517,7 +1391,9 @@ void noteUserActivity()
         idleBlinkFrame =
             false;
 
-        drawPrompt();
+        floraDisplay.leaveIdleAndRestore(
+            inputBuffer
+        );
     }
 }
 
@@ -569,32 +1445,15 @@ void updateIdleFace()
 
 void drawPrompt()
 {
-    auto &display = M5Cardputer.Display;
-
-    display.fillScreen(BLACK);
-    display.setCursor(4, 4);
-    display.setTextSize(1);
-    display.setTextWrap(true);
-
-    display.setTextColor(GREEN, BLACK);
-    display.println("F L O R A");
-    display.println("Poppy's pocket sister");
-    display.println("--------------------");
-
-    display.setTextColor(WHITE, BLACK);
-    display.println("Hi! I'm Flora.");
-    display.println("Ask me about your collection.");
-    display.println();
-
-    display.setTextColor(GREEN, BLACK);
-    display.print("> ");
-    display.setTextColor(WHITE, BLACK);
-    display.print(inputBuffer);
+    floraDisplay.showInput(
+        inputBuffer
+    );
 }
 
 void showRecord(const RecordInfo &record)
 {
-    auto &display = M5Cardputer.Display;
+    auto &display =
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -685,7 +1544,7 @@ void showError(
     const String &message)
 {
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -1416,7 +2275,7 @@ void showRfidResult(
     const RfidInfo &rfid)
 {
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -2147,7 +3006,8 @@ void showNetworkStatus(
     const String &line1,
     const String &line2 = "")
 {
-    auto &display = M5Cardputer.Display;
+    auto &display =
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -2236,7 +3096,7 @@ void drawWifiEntryScreen(
     bool maskValue)
 {
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -2460,7 +3320,7 @@ bool promptForTemporaryWifi()
     );
 
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -2492,7 +3352,7 @@ void forgetTemporaryWifi()
     );
 
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -3152,7 +4012,7 @@ void showManifest(
     const char *etag)
 {
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -5272,6 +6132,8 @@ struct ToolRequest
 String countScopeLabel(
     const ToolRequest &request);
 
+void clearRecentRankContext();
+
 // FLORA1-CONVO3: successful scoped count queries establish conversation
 // context just like value/rank queries. This allows follow-ups such as
 // "what are the top 4 most valuable ones?" to reuse Batman/Good Girl Art.
@@ -5323,6 +6185,8 @@ bool rememberConversationFromCountRequest(
         scope,
         domain
     );
+
+    clearRecentRankContext();
 
     Serial.print(
         "CONTEXT_SET source=count scope=["
@@ -5625,7 +6489,7 @@ void showFindAmbiguity(
     size_t totalMatches)
 {
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -6455,10 +7319,6 @@ bool scanValueGroup(
     return true;
 }
 
-// FLORA1-CONVO2 forward declaration. The concrete RecentRankContext
-// implementation is defined with the ranking subsystem later in this file.
-void clearRecentRankContext();
-
 void clearValueConversation()
 {
     pendingValueGroupQuery = "";
@@ -6528,7 +7388,7 @@ void showValueGroupSummary(
     valueItemizationOffset = 0;
 
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -6793,7 +7653,7 @@ bool showValueItemizationPage(
     }
 
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -8020,7 +8880,8 @@ void showRankedValueGroup(
     const String &query,
     ValueGroupDomain domain,
     size_t limit,
-    bool descending)
+    bool descending,
+    bool includeIds)
 {
     static RankedValueItem results[
         FLORA_MAX_RANK_RESULTS
@@ -8077,7 +8938,7 @@ void showRankedValueGroup(
         );
 
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -8110,19 +8971,33 @@ void showRankedValueGroup(
         display.print(". ");
         display.print(record.title);
 
-        if (record.seriesNumber > 0)
+        if (includeIds)
         {
-            display.print(" #");
-            display.print(
-                record.seriesNumber
+            display.println();
+            display.print("   ");
+            display.print(record.id);
+            display.print(" | $");
+            display.println(
+                record.currentValueUsd,
+                2
             );
         }
+        else
+        {
+            if (record.seriesNumber > 0)
+            {
+                display.print(" #");
+                display.print(
+                    record.seriesNumber
+                );
+            }
 
-        display.print(" $");
-        display.println(
-            record.currentValueUsd,
-            2
-        );
+            display.print(" $");
+            display.println(
+                record.currentValueUsd,
+                2
+            );
+        }
 
         Serial.print(
             "VALUE_RANK_ITEM "
@@ -8199,7 +9074,20 @@ void showRankedValueGroup(
         Serial.print(
             results[i].record.title
         );
-        Serial.print(" - $");
+
+        if (includeIds)
+        {
+            Serial.print(" | ");
+            Serial.print(
+                results[i].record.id
+            );
+            Serial.print(" | $");
+        }
+        else
+        {
+            Serial.print(" - $");
+        }
+
         Serial.println(
             results[i].record.currentValueUsd,
             2
@@ -8224,7 +9112,7 @@ bool refersToRecentRankSet(
         lower.indexOf("top ") >= 0;
 }
 
-bool isRecentRankIdFollowup(
+bool asksForIdFields(
     const String &input)
 {
     const String lower =
@@ -8232,18 +9120,28 @@ bool isRecentRankIdFollowup(
             input
         );
 
-    const bool asksForId =
+    return
         lower.indexOf(" ids") >= 0 ||
         lower.endsWith("ids") ||
         lower.indexOf(" id ") >= 0 ||
         lower.endsWith(" id") ||
         lower.indexOf("unique id") >= 0 ||
         lower.indexOf("unique ids") >= 0;
+}
 
-    if (!asksForId)
+bool isRecentRankIdFollowup(
+    const String &input)
+{
+    if (!asksForIdFields(
+            input))
     {
         return false;
     }
+
+    const String lower =
+        normalizedCommandLower(
+            input
+        );
 
     return
         refersToRecentRankSet(
@@ -8267,7 +9165,7 @@ void showRecentRankIds()
     }
 
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -8365,7 +9263,7 @@ void showRecentRankValueSummary()
     }
 
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -8434,7 +9332,7 @@ void showRecentRankCount()
     }
 
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -8466,6 +9364,86 @@ void showRecentRankCount()
         copies == 1
             ? " owned copy."
             : " owned copies."
+    );
+}
+
+bool isContextValueItemizationFollowup(
+    const String &input)
+{
+    const String lower =
+        normalizedCommandLower(
+            input
+        );
+
+    const bool asksValue =
+        lower.indexOf("value") >= 0 ||
+        lower.indexOf("worth") >= 0;
+
+    const bool asksEach =
+        lower.indexOf("each") >= 0 ||
+        lower.indexOf("individual") >= 0 ||
+        lower.indexOf("itemize") >= 0 ||
+        lower.indexOf("itemise") >= 0;
+
+    const bool refersBack =
+        lower.indexOf("those") >= 0 ||
+        lower.indexOf("these") >= 0 ||
+        lower.indexOf("them") >= 0 ||
+        lower.indexOf("they") >= 0;
+
+    return asksValue && asksEach && refersBack;
+}
+
+void showRecentRankValues()
+{
+    if (!recentRankContext.valid ||
+        recentRankContext.count == 0)
+    {
+        showError(
+            "I don't have a recent ranked list to reference."
+        );
+        return;
+    }
+
+    auto &display =
+        floraDisplay;
+
+    display.setTextColor(
+        WHITE,
+        BLACK
+    );
+
+    for (size_t i = 0;
+         i < recentRankContext.count;
+         ++i)
+    {
+        const RecordInfo &record =
+            recentRankContext.records[i];
+
+        display.print(i + 1);
+        display.print(". ");
+        display.print(record.title);
+        display.print(" | $");
+        display.println(
+            record.currentValueUsd,
+            2
+        );
+
+        Serial.print("CONTEXT_VALUE_ITEM ");
+        Serial.print(i + 1);
+        Serial.print(" | ");
+        Serial.print(record.title);
+        Serial.print(" | ");
+        Serial.print(record.id);
+        Serial.print(" | $");
+        Serial.println(
+            record.currentValueUsd,
+            2
+        );
+    }
+
+    Serial.println(
+        "FLORA_SAYS Here are the individual values from that ranked list."
     );
 }
 
@@ -8531,7 +9509,7 @@ void showContextCount()
         );
 
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -9073,7 +10051,8 @@ bool validateDeterministicTools()
 void showCountResult(
     const CountResult &counts)
 {
-    auto &display = M5Cardputer.Display;
+    auto &display =
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -9109,7 +10088,7 @@ void showCountResult(
     const ToolRequest &request)
 {
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -9180,7 +10159,8 @@ void showListResult(
     RecordInfo *records,
     size_t count)
 {
-    auto &display = M5Cardputer.Display;
+    auto &display =
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -11428,7 +12408,7 @@ bool showRheaStatus()
         ESP.getFreeHeap();
 
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -11626,7 +12606,7 @@ bool runF6Diagnostics()
     );
 
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.fillScreen(BLACK);
     display.setCursor(4, 4);
@@ -11993,7 +12973,9 @@ void runSearch()
 
     // Keep the idle avatar from replacing in-progress/result UI.
     // The full 120-second idle countdown starts when this command exits.
-    CommandActivityScope commandActivityScope;
+    CommandActivityScope commandActivityScope(
+        inputBuffer
+    );
 
     String lower =
         lowerCopy(inputBuffer);
@@ -12054,7 +13036,7 @@ void runSearch()
             );
 
             auto &display =
-                M5Cardputer.Display;
+        floraDisplay;
 
             display.fillScreen(BLACK);
             display.setCursor(4, 4);
@@ -12116,7 +13098,7 @@ void runSearch()
             Serial.println("\".");
 
             auto &display =
-                M5Cardputer.Display;
+        floraDisplay;
 
             display.fillScreen(BLACK);
             display.setCursor(4, 4);
@@ -12360,16 +13342,6 @@ void runSearch()
         return;
     }
 
-    // FLORA1-CONVO2: resolve pronouns against the concrete result set from
-    // the most recent ranking before attempting a new intent classification.
-    if (isRecentRankIdFollowup(
-            commandText))
-    {
-        showRecentRankIds();
-        inputBuffer = "";
-        return;
-    }
-
     // FLORA1-CONVO1: deterministic conversational layer runs before the
     // older exact-phrase and statistical classifier paths.
     if (looksLikeRankValueQuestion(
@@ -12422,6 +13394,11 @@ void runSearch()
                 commandLower.indexOf(
                     "lowest value") < 0;
 
+            const bool includeIds =
+                asksForIdFields(
+                    commandText
+                );
+
             showRankedValueGroup(
                 scope,
                 domain,
@@ -12429,8 +13406,61 @@ void runSearch()
                     commandLower,
                     4
                 ),
-                descending
+                descending,
+                includeIds
             );
+        }
+
+        inputBuffer = "";
+        return;
+    }
+
+    // FLORA1-CONVO2: resolve pronouns against the concrete result set from
+    // the most recent ranking before attempting a new intent classification.
+    if (isRecentRankIdFollowup(
+            commandText))
+    {
+        showRecentRankIds();
+        inputBuffer = "";
+        return;
+    }
+
+    if (isContextValueItemizationFollowup(
+            commandText))
+    {
+        if (recentRankContext.valid &&
+            refersToRecentRankSet(
+                commandText))
+        {
+            showRecentRankValues();
+        }
+        else if (!conversationContext.valid)
+        {
+            showError(
+                "I don't have a collection scope to reuse yet."
+            );
+        }
+        else
+        {
+            pendingValueGroupQuery =
+                conversationContext.scope;
+            pendingValueGroupDomain =
+                conversationContext.domain;
+            pendingValueItemizationOffer =
+                false;
+            valueItemizationActive =
+                true;
+            valueItemizationOffset = 0;
+
+            if (!showValueItemizationPage(
+                    conversationContext.scope,
+                    0,
+                    conversationContext.domain))
+            {
+                showError(
+                    "I couldn't itemize that value set."
+                );
+            }
         }
 
         inputBuffer = "";
@@ -12558,7 +13588,7 @@ void runSearch()
                 valuedCopies))
         {
             auto &display =
-                M5Cardputer.Display;
+        floraDisplay;
 
             display.fillScreen(BLACK);
             display.setCursor(4, 4);
@@ -12841,6 +13871,12 @@ void runSearch()
                 ""
             },
             {
+                "what are the titles and IDs of my top 4 most valuable Spider-Man pops?",
+                true,
+                4,
+                "spider-man"
+            },
+            {
                 "show me the top 3 least valuable good girl art pins",
                 true,
                 3,
@@ -12934,6 +13970,20 @@ void runSearch()
                 ValueGroupDomain::Pops &&
             referentialScope.length() == 0;
 
+        const String explicitSwitchScope =
+            extractRankScope(
+                "what are the titles and IDs of my top 4 most valuable Spider-Man pops?"
+            );
+
+        const bool contextSwitchOk =
+            explicitSwitchScope ==
+                "spider-man";
+
+        const bool eachValuesFollowupOk =
+            isContextValueItemizationFollowup(
+                "what are the values of each of those?"
+            );
+
         Serial.print(
             contextSequenceOk
                 ? "PASS "
@@ -12944,6 +13994,34 @@ void runSearch()
         );
 
         if (!contextSequenceOk)
+        {
+            passed = false;
+        }
+
+        Serial.print(
+            contextSwitchOk
+                ? "PASS "
+                : "FAIL "
+        );
+        Serial.println(
+            "Batman context -> explicit Spider-Man rank + IDs"
+        );
+
+        if (!contextSwitchOk)
+        {
+            passed = false;
+        }
+
+        Serial.print(
+            eachValuesFollowupOk
+                ? "PASS "
+                : "FAIL "
+        );
+        Serial.println(
+            "count scope -> values of each of those"
+        );
+
+        if (!eachValuesFollowupOk)
         {
             passed = false;
         }
@@ -13059,7 +14137,7 @@ void runSearch()
         );
 
         auto &display =
-            M5Cardputer.Display;
+        floraDisplay;
 
         display.fillScreen(BLACK);
         display.setCursor(4, 4);
@@ -13097,7 +14175,7 @@ void runSearch()
             validateF6Features();
 
         auto &display =
-            M5Cardputer.Display;
+        floraDisplay;
 
         display.fillScreen(BLACK);
         display.setCursor(4, 4);
@@ -13141,7 +14219,7 @@ void runSearch()
     if (lower == "personatest")
     {
         auto &display =
-            M5Cardputer.Display;
+        floraDisplay;
 
         display.fillScreen(BLACK);
         display.setCursor(4, 4);
@@ -13174,7 +14252,7 @@ void runSearch()
             validateToolDispatcher();
 
         auto &display =
-            M5Cardputer.Display;
+        floraDisplay;
 
         display.fillScreen(BLACK);
         display.setCursor(4, 4);
@@ -13202,7 +14280,7 @@ void runSearch()
             validateAdversarialRouting();
 
         auto &display =
-            M5Cardputer.Display;
+        floraDisplay;
 
         display.fillScreen(BLACK);
         display.setCursor(4, 4);
@@ -13312,7 +14390,7 @@ void runSearch()
         );
 
         auto &display =
-            M5Cardputer.Display;
+        floraDisplay;
 
         display.fillScreen(BLACK);
         display.setCursor(4, 4);
@@ -13354,7 +14432,7 @@ void runSearch()
             validateNaturalLanguageRouter();
 
         auto &display =
-            M5Cardputer.Display;
+        floraDisplay;
 
         display.fillScreen(BLACK);
         display.setCursor(4, 4);
@@ -13535,7 +14613,7 @@ void runSearch()
         else
         {
             auto &display =
-                M5Cardputer.Display;
+        floraDisplay;
 
             display.fillScreen(BLACK);
             display.setCursor(4, 4);
@@ -13686,7 +14764,7 @@ void runSearch()
             else
             {
                 auto &display =
-                    M5Cardputer.Display;
+        floraDisplay;
 
                 display.fillScreen(BLACK);
                 display.setCursor(4, 4);
@@ -13756,7 +14834,7 @@ void runSearch()
         else
         {
             auto &display =
-                M5Cardputer.Display;
+        floraDisplay;
 
             display.fillScreen(BLACK);
             display.setCursor(4, 4);
@@ -13875,7 +14953,7 @@ void runSearch()
         ToolKind::Unknown)
     {
         auto &display =
-            M5Cardputer.Display;
+        floraDisplay;
 
         display.fillScreen(BLACK);
         display.setCursor(4, 4);
@@ -13974,7 +15052,7 @@ void runSearch()
     else
     {
         auto &display =
-            M5Cardputer.Display;
+        floraDisplay;
 
         display.fillScreen(BLACK);
         display.setCursor(4, 4);
@@ -14122,6 +15200,25 @@ void processKeyboardEdges()
             continue;
         }
 
+        // Cardputer Fn layer: Fn+; = Up, Fn+. = Down.
+        if (state.fn &&
+            baseCode == ';')
+        {
+            floraDisplay.scrollUp(
+                inputBuffer
+            );
+            continue;
+        }
+
+        if (state.fn &&
+            baseCode == '.')
+        {
+            floraDisplay.scrollDown(
+                inputBuffer
+            );
+            continue;
+        }
+
         if (state.fn)
         {
             continue;
@@ -14198,8 +15295,17 @@ void setup()
     auto cfg = M5.config();
     M5Cardputer.begin(cfg);
 
+    SPI.begin(
+        SD_SPI_SCK_PIN,
+        SD_SPI_MISO_PIN,
+        SD_SPI_MOSI_PIN,
+        SD_SPI_CS_PIN
+    );
+
+    initializeExternalMirror();
+
     auto &display =
-        M5Cardputer.Display;
+        floraDisplay;
 
     display.setRotation(1);
     display.fillScreen(BLACK);
@@ -14211,13 +15317,6 @@ void setup()
     printBoth("R H E A");
     printBoth("RHEA1-F4B natural-language router");
     printBoth("--------------------");
-
-    SPI.begin(
-        SD_SPI_SCK_PIN,
-        SD_SPI_MISO_PIN,
-        SD_SPI_MOSI_PIN,
-        SD_SPI_CS_PIN
-    );
 
     Serial.print("SD SPI frequency: ");
     Serial.println(SD_SPI_FREQUENCY_HZ);
